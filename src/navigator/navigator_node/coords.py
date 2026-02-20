@@ -7,18 +7,16 @@ translations to the physical Rover.
 """
 
 import math
-import sys
 from math import sqrt
 
 from geographic_msgs.msg import GeoPoint, GeoPointStamped
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import Point, Pose
 from geopy.distance import distance
+from geopy.point import Point as GeopyPoint
 from loguru import logger as llogger
 
 
-def coordinate_from_aruco_pose(
-    _current_location: GeoPointStamped, _pose: PoseStamped
-) -> GeoPoint:
+def coordinate_from_aruco_pose(current_location: GeoPoint, pose: Pose) -> GeoPoint:
     """
     Given the Rover's current location and the ArUco marker's current pose,
     this function calculates an approximate coordinate for the marker.
@@ -30,19 +28,55 @@ def coordinate_from_aruco_pose(
     we can use that and the distance to the marker to calculate the estimated
     coordinate.
     """
-    _marker_position: Point = _pose.pose.position
-    _marker_orientation = _pose.pose.orientation
+    marker_position: Point = pose.position
 
-    llogger.error("coordinate estimation is unimplemented!")
-    sys.exit(1)
+    # `PoseStamped.position` from `aruco_node` is Rover-local translation in meters.
+    #
+    # We treat:
+    # - `position.x` as North/South offset meters (+North),
+    # - `position.y` as East/West offset meters (+East),
+    #
+    # then convert those meter offsets to geodesic `distance` + `bearing`.
+    north_offset_m: float = marker_position.x
+    east_offset_m: float = marker_position.y
+    up_offset_m: float = marker_position.z
+
+    # Convert Cartesian rover-local meters -> polar meters/degrees:
+    #
+    # - distance in meters from rover to marker
+    # - bearing in degrees clockwise from North (what geopy expects)
+    distance_to_marker_m: float = math.hypot(north_offset_m, east_offset_m)
+    marker_bearing_deg: float = math.degrees(math.atan2(east_offset_m, north_offset_m))
+
+    # Convert current ROS `GeoPointStamped.position` -> geopy `Point` (lat, lon).
+    current_geopy_point: GeopyPoint = GeopyPoint(
+        current_location.latitude,
+        current_location.longitude,
+    )
+
+    # Convert Rover coordinate + (distance, bearing) -> destination geodesic
+    # point.
+    estimated_geopy_point: GeopyPoint = distance(
+        meters=distance_to_marker_m
+    ).destination(current_geopy_point, bearing=marker_bearing_deg)
+
+    # Convert geopy destination type -> ROS `GeoPoint`.
+    estimated_marker_coord: GeoPoint = GeoPoint()
+    estimated_marker_coord.latitude = estimated_geopy_point.latitude
+    estimated_marker_coord.longitude = estimated_geopy_point.longitude
+
+    # Preserve absolute altitude by adding local vertical offset in meters.
+    estimated_marker_coord.altitude = current_location.altitude + up_offset_m
+
+    return estimated_marker_coord
 
 
-def get_distance_to_marker(marker: PoseStamped) -> float:
+def get_distance_to_marker(marker: Pose) -> float:
     """
     Given the pose information for an ArUco marker relative to the rover,
     calculate the distance to the marker
     """
-    marker_position: Point = marker.pose.position
+    marker_position: Point = marker.position
     distance_x: float = marker_position.x  # forward/backward distance
     distance_y: float = marker_position.y  # left/right distance
 
@@ -91,3 +125,34 @@ def dist_m_between_coords(coord1: GeoPoint, coord2: GeoPoint) -> float:
     # log and return
     llogger.trace(f"dist from coord 1 ({coord1}) and coord 2 ({coord2}) is: {dist_m}m")
     return dist_m
+
+
+def generate_similar_coordinates(
+    src: GeoPoint, radius: float, num_points: int
+) -> list[GeoPoint]:
+    """
+    Given a coordinate, a radius in meters, and a number of points to return, this function
+    takes the source coordinate and uses it to generate a list of new coordinates in
+    a sequential radius around the starting coordinate.
+
+    This functions as a simplistic "search" strategy for the rover, where we can then feed
+    the generated coordinates as our desired path while we look for a tag or object.
+    """
+    new_points: list[GeoPoint] = []
+
+    for i in range(num_points):
+        angle = (360 / num_points) * i  # Evenly spaced angles around a circle
+
+        # Calculates a new coordinate that is the given amount of meters away from source
+        point: GeopyPoint = distance(meters=radius).destination(
+            GeopyPoint(src.latitude, src.longitude), bearing=angle
+        )
+
+        # make that into a `GeoPoint` msg
+        g: GeoPoint = GeoPoint()
+        g.latitude = point.latitude
+        g.longitude = point.longitude
+
+        new_points.append(g)
+
+    return new_points

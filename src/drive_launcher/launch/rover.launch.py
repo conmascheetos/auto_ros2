@@ -18,6 +18,9 @@ from launch_ros.actions import Node
 def generate_launch_description() -> LaunchDescription:
     # whether or not we'll launch using sim time.
     use_sim_time = LaunchConfiguration("use_sim_time")
+    ros2_control_plugin = LaunchConfiguration("ros2_control_plugin")
+    use_gazebo_ros2_control = LaunchConfiguration("use_gazebo_ros2_control")
+    start_controller_manager = LaunchConfiguration("start_controller_manager")
 
     # start the utm conversion node.
     #
@@ -53,17 +56,9 @@ def generate_launch_description() -> LaunchDescription:
     # directly by our Navigator).
     robot_localization: IncludeLaunchDescription = _robot_localization(use_sim_time)
 
-    # the `depthimage_to_laserscan::depthimage_to_laserscan_node` gives us
-    # another source of `/tf:map` data.
-    #
-    # it converts our depth camera data (from the Zed 2i) into usable point
-    # clouds, which you'd otherwise have to get from a laser scanner.
-    #
-    # our Rover doesn't have one of those..! so, for object avoidance, we use
-    # this node to add boundaries to our map.
-    depthimage_to_laserscan: IncludeLaunchDescription = _depthimage_to_laserscan(
-        use_sim_time
-    )
+    # Convert Unitree LiDAR point clouds into LaserScan for scan-based nodes
+    # (e.g., slam_toolbox and collision monitor).
+    lidar_to_laserscan: IncludeLaunchDescription = _lidar_to_laserscan(use_sim_time)
 
     # ok, so this part launches a few different things...
     #
@@ -91,7 +86,7 @@ def generate_launch_description() -> LaunchDescription:
     # is required for consistent mapping, good navigation, and object
     # avoidance.
     robot_state_publisher: IncludeLaunchDescription = _robot_state_publisher(
-        use_sim_time
+        use_sim_time, ros2_control_plugin, use_gazebo_ros2_control
     )
 
     # `ros2_control` is a collection of nodes that we use to control the Rover.
@@ -112,17 +107,31 @@ def generate_launch_description() -> LaunchDescription:
     # there are no cross-platform networking APIs in the C++ stdlib. note that
     # `boost` could be an option in the future if future Autonomous members9
     # would like to move toward a `ros2_control`-based approach.
-    ros2_control: IncludeLaunchDescription = _ros2_control(use_sim_time)
+    ros2_control: IncludeLaunchDescription = _ros2_control(
+        use_sim_time, start_controller_manager
+    )
 
     return LaunchDescription(
         [
             DeclareLaunchArgument(
                 "use_sim_time",
             ),
+            DeclareLaunchArgument(
+                "ros2_control_plugin",
+                default_value="fake_components/GenericSystem",
+            ),
+            DeclareLaunchArgument(
+                "use_gazebo_ros2_control",
+                default_value="false",
+            ),
+            DeclareLaunchArgument(
+                "start_controller_manager",
+                default_value="true",
+            ),
             utm_conversion_node,
             robot_state_publisher,
             robot_localization,
-            depthimage_to_laserscan,
+            lidar_to_laserscan,
             navigation_stack,
             ros2_control,
             Node(
@@ -158,6 +167,8 @@ def _robot_localization(
 
 def _robot_state_publisher(
     use_sim_time: LaunchConfiguration,
+    ros2_control_plugin: LaunchConfiguration,
+    use_gazebo_ros2_control: LaunchConfiguration,
 ) -> IncludeLaunchDescription:
     pkg_drive_launcher: str = get_package_share_directory("drive_launcher")
 
@@ -174,7 +185,11 @@ def _robot_state_publisher(
                 )
             ]
         ),
-        launch_arguments=[("use_sim_time", (use_sim_time))],
+        launch_arguments=[
+            ("use_sim_time", use_sim_time),
+            ("ros2_control_plugin", ros2_control_plugin),
+            ("use_gazebo_ros2_control", use_gazebo_ros2_control),
+        ],
     )
 
 
@@ -199,7 +214,7 @@ def _navigation_bringup(
     )
 
 
-def _depthimage_to_laserscan(
+def _lidar_to_laserscan(
     use_sim_time: LaunchConfiguration,
 ) -> IncludeLaunchDescription:
     pkg_drive_launcher: str = get_package_share_directory("drive_launcher")
@@ -211,7 +226,7 @@ def _depthimage_to_laserscan(
                         pkg_drive_launcher,
                         "launch",
                         "helpers",
-                        "depthimage_to_laserscan.launch.py",
+                        "lidar_to_laserscan.launch.py",
                     ]
                 )
             ]
@@ -222,6 +237,7 @@ def _depthimage_to_laserscan(
 
 def _ros2_control(
     use_sim_time: LaunchConfiguration,
+    start_controller_manager: LaunchConfiguration,
 ) -> IncludeLaunchDescription:
     pkg_drive_launcher: str = get_package_share_directory("drive_launcher")
 
@@ -238,5 +254,8 @@ def _ros2_control(
                 )
             ]
         ),
-        launch_arguments=[("use_sim_time", use_sim_time)],
+        launch_arguments=[
+            ("use_sim_time", use_sim_time),
+            ("start_controller_manager", start_controller_manager),
+        ],
     )

@@ -7,6 +7,14 @@
 
 /**:
   ros__parameters:
+    qos_overrides:
+      /unilidar/imu:
+        subscription:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+          durability: volatile
+
     # behavior
     two_d_mode: true
     publish_tf: false
@@ -47,7 +55,7 @@
     # imu input.
     #
     # here, it provides heading and velo in the forward direction.
-    imu0: /sensors/imu
+    imu0: /unilidar/imu
     imu0_config:
       [
         false,

@@ -5,6 +5,14 @@
 
 /**:
   ros__parameters:
+    qos_overrides:
+      /unilidar/imu:
+        subscription:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+          durability: volatile
+
     # behavior
     two_d_mode: true
     publish_tf: true
@@ -21,7 +29,7 @@
     debug_out_file: rl_ekf_filter_node_odom.log
 
     # configure imu for local usage
-    imu0: /sensors/imu
+    imu0: /unilidar/imu
     imu0_config:
       [
         false,
@@ -36,8 +44,8 @@
         false,
         false,
         true,
-        true,
-        true,
+        false,
+        false,
         false,
       ]
 

@@ -1,8 +1,12 @@
 import asyncio
 import sys
 from dataclasses import dataclass
+from queue import PriorityQueue
+from typing import cast
 
 import rclpy
+from builtin_interfaces.msg import Time
+from custom_interfaces.action import FindArucoWithPose
 from custom_interfaces.srv import GnssToMap, Lights
 from custom_interfaces.srv._gnss_to_map import GnssToMap_Response
 from custom_interfaces.srv._lights import (
@@ -12,10 +16,11 @@ from custom_interfaces.srv._lights import (
     Lights_Response as LightsResponse,
 )
 from geographic_msgs.msg import GeoPoint, GeoPointStamped
-from geometry_msgs.msg import Point, PoseStamped, Twist
+from geometry_msgs.msg import Point, Pose, PoseStamped, Twist
 from loguru import logger as llogger
 from nav2_simple_commander.robot_navigator import BasicNavigator
 from rcl_interfaces.msg import ParameterType
+from rclpy.action.client import ActionClient
 from rclpy.client import Client
 from rclpy.node import (
     Node,
@@ -27,7 +32,12 @@ from rclpy.subscription import Subscription
 from sensor_msgs.msg import NavSatFix
 from typing_extensions import override
 
-from .coords import dist_m_between_coords
+from .coords import (
+    coordinate_from_aruco_pose,
+    dist_m_between_coords,
+    generate_similar_coordinates,
+    get_distance_to_marker,
+)
 from .pose import geopoint_to_pose
 from .types import (
     NavigationMode,
@@ -62,8 +72,10 @@ class NavigatorNode(Node):
     """
     _gps_subscription: Subscription
     """A subscriber to the GPS (NavSat) to know where the Rover is."""
-    _aruco_subscription: Subscription
-    """Subscription to the `aruco_node` to understand what it's found so far."""
+
+    _aruco_client: ActionClient
+    """An action client for the `aruco_node` to understand what it's found so far and receive feedback."""
+
     _lights_client: Client
     """
     Service client for the Lights node. We use it to tell the `lights_node` to
@@ -85,12 +97,15 @@ class NavigatorNode(Node):
 
     _last_known_rover_coord: GeoPointStamped | None = None
     """The coordinate last recv'd from the GPS."""
-    _last_known_marker_coord: GeoPointStamped | None = None
+    _last_known_marker_coord: GeoPoint | None = None
     """Coordinate pair where the target was last known to be located."""
     _gps_to_map_client: Client
     """A client to speak with the `utm_conversion_node`."""
 
-    _curr_marker_transform: PoseStamped | None = None
+    _aruco_action_feedback: FindArucoWithPose.Feedback | None = None
+    """A variable to store the latest feedback from the ArUco action server."""
+
+    _curr_marker_transform: Pose | None = None
     """
     The location of the ArUco marker relative to the Rover.
 
@@ -193,12 +208,11 @@ class NavigatorNode(Node):
 
         # if in aruco mode, create a subscriber for aruco tracking
         if self.nav_parameters.mode == NavigationMode.ARUCO:
-            llogger.info("We're in ArUco mode. Creating sub to ArUco topic...")
-            self._aruco_subscription = self.create_subscription(
-                msg_type=PoseStamped,
-                topic="/marker_pose",
-                callback=self.aruco_callback,
-                qos_profile=SENSORS_QOS_PROFILE,
+            llogger.info("We're in ArUco mode. Creating ArUco client...")
+            self._aruco_client = ActionClient(
+                node=self,
+                action_type=FindArucoWithPose,
+                action_name="find_aruco_with_pose",
             )
 
         # connect to our sensors using subscriptions
@@ -268,7 +282,7 @@ class NavigatorNode(Node):
                 _ = self.get_logger().info(
                     "At requested coordinate! Now searching for ArUco marker."
                 )
-                await self.handle_aruco_navigation()
+                await self._handle_aruco_navigation()
             case NavigationMode.OBJECT_DETECTION:
                 _ = self.get_logger().info(
                     "At requested coordinate! Now performing object detection search."
@@ -406,21 +420,253 @@ class NavigatorNode(Node):
         # alright, we've finished coordinate navigation! let's tell the user...
         llogger.info("Navigated to target successfully!")
 
-    # TODO(log): implement
-    async def handle_aruco_navigation(self):
+    async def _handle_aruco_navigation(self):
         """
         Performs the second step of the Navigator node (if requested), which is
         ArUco navigation.
         """
 
-        # Ensure we've at least seen the aruco marker once
-        if self._curr_marker_transform is None:
-            llogger.debug(
-                f"Haven't seen the ArUco marker (id: {self._given_aruco_marker_id}) yet. Performing search algorithm..."
+        goal_msg = FindArucoWithPose.Goal()
+
+        # Wait for the ArUco action server to be up
+        llogger.debug("Waiting for ArUco action server to be ready...")
+        await self._aruco_client.wait_for_server()
+
+        # Send empty goal to start the action
+        llogger.debug("Sending goal to ArUco action server...")
+        send_goal_future = self._aruco_client.send_goal_async(
+            goal_msg, feedback_callback=self.aruco_feedback_callback
+        )
+
+        try:
+            await send_goal_future
+        except Exception as e:
+            llogger.error(f"Failed to send goal to ArUco action server: {e}")
+            return
+
+        # Start async search task
+        await self._search_for_aruco()
+
+        llogger.info("ArUco navigation complete!")
+
+    async def _search_for_aruco(self):
+        """
+        Moves the Rover circles until the target marker id is found.
+        """
+        # Create a priority queue of coordinates, where priority is distance to current location
+        # OR most urgent priority for an estimated marker location (not currently doing this, but could be a future improvement)
+        coordinate_queue: PriorityQueue[tuple[float, GeoPoint]] = PriorityQueue()
+        marker_missed_count = (
+            0  # how many times have we been tracking and not seen the marker?
+        )
+        tracking_marker = False  # are we currently tracking a marker?
+        last_received_feedback_time: Time | None = None
+
+        # Variable to store the current search task, so we can cancel it if we lose the marker
+        current_search_task: asyncio.Task[None] | None = None
+
+        while True:
+            # Check if new feedback received. If not, wait and check again
+            if (
+                self._aruco_action_feedback is None
+                or self._aruco_action_feedback.time_last_image_arrived
+                == last_received_feedback_time
+            ):
+                llogger.info("Waiting for feedback from ArUco action server...")
+                await asyncio.sleep(0.5)
+                continue
+
+            # Check if coordinate of rover is known. If not, wait and check again
+            if self._last_known_rover_coord is None:
+                llogger.info("Waiting for GPS coordinate to be known...")
+                await asyncio.sleep(0.5)
+                continue
+
+            # Store time of last received feedback
+            last_received_feedback_time = (
+                self._aruco_action_feedback.time_last_image_arrived
             )
-            _ = self.get_logger().fatal("searching for aruco is unimplemented!")
-            shutdown(self)
-            sys.exit(1)
+
+            marker_ids = cast(list[int], list(self._aruco_action_feedback.marker_ids))
+            marker_poses = cast(
+                list[Pose], list(self._aruco_action_feedback.marker_poses)
+            )
+
+            # Case 1: Marker has been seen recently
+            if (
+                self._given_aruco_marker_id is not None
+                and self._given_aruco_marker_id in marker_ids
+            ):
+                llogger.info("Marker seen!")
+                marker_index = marker_ids.index(self._given_aruco_marker_id)
+
+                try:
+                    marker_pose: Pose = marker_poses[marker_index]
+                except Exception as e:
+                    llogger.error(
+                        f"Error retrieving marker pose from feedback: {e}. Skipping this feedback and waiting for the next one..."
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+
+                (
+                    tracking_marker,
+                    marker_missed_count,
+                    current_search_task,
+                ) = await self._handle_marker_seen(
+                    self._last_known_rover_coord.position,
+                    tracking_marker,
+                    marker_missed_count,
+                    marker_pose,
+                    current_search_task,
+                )
+
+                # Check distance to marker. If close enough, we're done!
+                distance_to_marker = get_distance_to_marker(marker_pose)
+                llogger.debug(f"Distance to marker: {distance_to_marker} m")
+                if distance_to_marker < MIN_ARUCO_DISTANCE:
+                    llogger.info("Reached marker!")
+                    self.stop_wheels()
+                    return
+
+            # Case 2: Currently tracking a marker, but we don't see it right now
+            elif tracking_marker:
+                # Increment missed count
+                marker_missed_count += 1
+
+                (
+                    tracking_marker,
+                    current_search_task,
+                ) = await self._handle_marker_lost(
+                    marker_missed_count,
+                    current_search_task,
+                )
+
+            # Case 3: Generic search pattern for ArUco tag
+            else:
+                # Not tracking, time to search
+                current_search_task = await self._handle_search_mode(
+                    self._last_known_rover_coord.position,
+                    coordinate_queue,
+                    current_search_task,
+                )
+
+    async def _handle_marker_seen(
+        self,
+        current_location: GeoPoint,
+        tracking_marker: bool,
+        marker_missed_count: int,
+        marker_pose: Pose,
+        current_search_task: asyncio.Task[None] | None,
+    ) -> tuple[bool, int, asyncio.Task[None] | None]:
+        """
+        Handles logic for when the marker is seen in the ArUco feedback.
+
+        Returns updated values for parent function.
+        """
+        # If not currently tracking a marker, start new task
+        if not tracking_marker:
+            tracking_marker = True
+            marker_missed_count = 0
+
+            # Convert marker pose to coordinate
+            self._last_known_marker_coord = coordinate_from_aruco_pose(
+                current_location,
+                marker_pose,
+            )
+
+            # If search task, cancel it and start new one to go to marker coordinate
+            if current_search_task is not None:
+                _ = current_search_task.cancel()
+
+            llogger.info("Navigating to marker coordinate...")
+
+            # Start new search task to go to marker coordinate
+            current_search_task = asyncio.create_task(
+                self._go_to_coordinate(current_location)
+            )
+        # If already tracking the marker, check distance to coordinate
+        else:
+            # Reset missed count
+            marker_missed_count = 0
+
+        return tracking_marker, marker_missed_count, current_search_task
+
+    async def _handle_marker_lost(
+        self,
+        marker_missed_count: int,
+        current_search_task: asyncio.Task[None] | None,
+    ) -> tuple[bool, asyncio.Task[None] | None]:
+        """
+        Handles logic for when the marker is not seen in the ArUco feedback but we were previously tracking it.
+
+        Returns updated values for parent function.
+        """
+        MARKER_MISSED_THRESHOLD = 20  # TODO: Make this a parameter
+
+        # If missed count is too high, cancel current search task and stop tracking
+        if marker_missed_count > MARKER_MISSED_THRESHOLD:
+            llogger.warning(
+                f"Marker lost after {marker_missed_count} consecutive missed detections. \
+                Resuming search pattern."
+            )
+            # Cancel navigation to the lost marker
+            if current_search_task is not None:
+                _ = current_search_task.cancel()
+                current_search_task = None
+
+            return False, current_search_task
+        # Otherwise, return true and continue tracking
+        else:
+            # Brief delay before checking again to avoid spamming
+            await asyncio.sleep(0.5)
+            return True, current_search_task
+
+    async def _handle_search_mode(
+        self,
+        current_location: GeoPoint,
+        coordinate_queue: PriorityQueue[tuple[float, GeoPoint]],
+        current_search_task: asyncio.Task[None] | None,
+    ) -> asyncio.Task[None] | None:
+        """
+        Handles search pattern generation for ArUco logic when marker is not being tracked.
+
+        Relies on a priority queue of coordinates.
+        If the queue is empty, generates new search points in a circular pattern
+        around the current location. If queue has points, navigates to the next one.
+
+        Returns the current navigation task.
+        """
+        SEARCH_RADIUS = 10.0  # meters - TODO: Make this a parameter
+        SEARCH_POINTS = 10  # TODO: Make this a parameter
+
+        # Check if queue empty
+        if coordinate_queue.empty():
+            # Generate new search coordinates around current location
+            llogger.debug(f"Generating search pattern around: {current_location}")
+
+            similar_coords = generate_similar_coordinates(
+                current_location,
+                radius=SEARCH_RADIUS,
+                num_points=SEARCH_POINTS,
+            )
+
+            # Add coordinates to queue, prioritized by distance to current location
+            for coord in similar_coords:
+                distance_to_coord = dist_m_between_coords(current_location, coord)
+                coordinate_queue.put((distance_to_coord, coord))
+
+            llogger.debug(f"Added {len(similar_coords)} search points to queue")
+
+        # Get next coordinate from queue if no active task (queue shouldn't be empty now)
+        if current_search_task is None or current_search_task.done():
+            next_coord = coordinate_queue.get()[1]
+            llogger.info(f"Navigating to search point: {next_coord}")
+            current_search_task = asyncio.create_task(
+                self._go_to_coordinate(next_coord)
+            )
+
+        return current_search_task
 
     def _flash_lights(self):
         """
@@ -470,8 +716,12 @@ class NavigatorNode(Node):
         # finally, set that type on the navigator class
         self._last_known_rover_coord = gp_stamped
 
-    def aruco_callback(self, msg: PoseStamped):
-        self._curr_marker_transform = msg
+    def aruco_feedback_callback(self, feedback: FindArucoWithPose.Feedback):
+        # Store feedback
+        self._aruco_action_feedback = feedback
+
+        # Log feedback (can remove later if this clogs our logs)
+        llogger.debug(f"Received feedback from ArUco action server: {feedback}")
 
 
 """
