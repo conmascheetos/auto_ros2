@@ -1,22 +1,24 @@
 import os
-from scipy.spatial.transform import Rotation as R
+
 import cv2 as cv
 import cv2.aruco as aruco
 import numpy as np
 import pytest
 from cv2.typing import MatLike
+from numpy.typing import NDArray
 from pytest import approx
+from scipy.spatial.transform import Rotation as R
 
 from aruco_node.utils import (
-    calc_object_pose,
+    _calc_object_pose_inner,  # pyright: ignore[reportPrivateUsage]
 )
 
 
 @pytest.fixture
 def sim_aruco_dist_and_images() -> list[tuple[float, MatLike]]:
     """A list of simulated aruco images placed at varying distances from the camera."""
-    directory_path = "tests/sim_dist_aruco_images"
-    image_filenames = os.listdir(directory_path)
+    directory_path: str = f"{os.path.dirname(__file__)}/sim_dist_aruco_images"
+    image_filenames: list[str] = os.listdir(directory_path)
 
     dist_and_images: list[tuple[float, MatLike]] = []
     for image_filename in image_filenames:
@@ -35,8 +37,8 @@ def sim_aruco_dist_and_images() -> list[tuple[float, MatLike]]:
 @pytest.fixture
 def sim_aruco_rot_and_images() -> list[tuple[tuple[float, float, float], MatLike]]:
     """A list of simulated aruco images rotated relative to the camera in different ways."""
-    directory_path = "tests/sim_rot_aruco_images"
-    image_filenames = os.listdir(directory_path)
+    directory_path: str = f"{os.path.dirname(__file__)}/sim_rot_aruco_images"
+    image_filenames: list[str] = os.listdir(directory_path)
 
     rot_and_images: list[tuple[tuple[float, float, float], MatLike]] = []
     for image_filename in image_filenames:
@@ -48,7 +50,10 @@ def sim_aruco_rot_and_images() -> list[tuple[tuple[float, float, float], MatLike
 
         # Read the image
         image = cv.imread(f"{directory_path}/{image_filename}")
-        rot_and_image: tuple[tuple[float, float, float], MatLike] = (angles, image)
+        rot_and_image: tuple[tuple[float, float, float], MatLike] = (
+            angles,
+            image,
+        )
         rot_and_images.append(rot_and_image)
 
     # Return the distance that the aruco marker is from the image and the image
@@ -121,21 +126,25 @@ def test_aruco_dist_from_sim_image(
         ) = aruco_detector.detectMarkers(image)
 
         # Calculate the distance from the camera to the marker
-        success, quat, tvec = calc_object_pose(
+        res = _calc_object_pose_inner(
             aruco_object_points,
             detected_marker_corners[0],
             camera_matrix,
             dist_coeffs,
         )
-        approx_dist = np.linalg.norm(tvec)
+        assert res is not None
+
+        orientation: NDArray[np.float64] = res[0]
+        translation: NDArray[np.float64] = res[1]
+
+        approx_dist = np.linalg.norm(translation)
 
         # Make sure the pose was calculated without error and accurately
         expected_tvec = np.array([expected_dist, 0, 0])
         expected_quat = np.array([0, 0, 0, 1])
 
-        assert success
-        assert np.allclose(quat, expected_quat, atol=1.0)
-        assert np.allclose(tvec, expected_tvec, atol=1.0)
+        assert np.allclose(orientation, expected_quat, atol=1.0)
+        assert np.allclose(translation, expected_tvec, atol=1.0)
         assert expected_dist == approx(approx_dist, abs=1.0)
 
 
@@ -153,13 +162,17 @@ def test_aruco_rot_from_sim_image(
         (detected_marker_corners, _, _) = aruco_detector.detectMarkers(image)
 
         # Calculate the distance from the camera to the marker
-        success, quat, tvec = calc_object_pose(
+        res = _calc_object_pose_inner(
             aruco_object_points,
             detected_marker_corners[0],
             camera_matrix,
             dist_coeffs,
         )
-        approx_dist = np.linalg.norm(tvec)
+        assert res is not None
+        orientation: NDArray[np.float64] = res[0]
+        translation: NDArray[np.float64] = res[1]
+
+        approx_dist = np.linalg.norm(translation)
 
         # Make sure the pose was calculated without error and accurately
         expected_tvec = [1.0, 0.0, 0.0]
@@ -168,7 +181,6 @@ def test_aruco_rot_from_sim_image(
         rot_matrix = R.from_euler("xyz", np.radians(expected_rot))
         expected_quat = rot_matrix.as_quat()
 
-        assert success
-        assert np.allclose(quat, expected_quat, atol=1.0)
-        assert np.allclose(tvec, expected_tvec, atol=1.0)
+        assert np.allclose(orientation, expected_quat, atol=1.0)
+        assert np.allclose(translation, expected_tvec, atol=1.0)
         assert expected_dist == approx(approx_dist, abs=1.0)

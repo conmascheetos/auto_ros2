@@ -125,6 +125,11 @@ def generate_launch_description() -> LaunchDescription:
             depthimage_to_laserscan,
             navigation_stack,
             ros2_control,
+            Node(
+                executable="aruco_node",
+                package="aruco",
+                name="aruco_node",
+            ),
         ]
     )
 

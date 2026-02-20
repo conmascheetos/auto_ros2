@@ -1,41 +1,13 @@
-<!-- cargo-rdme start -->
+# `soro_gps`
 
-# `gps-rs`
+Connects to the GPS and provides its data in a readable format.
 
-Bindings to the Swift GPS library ([`gps/`](https://github.com/Sooner-Rover-Team/gps)).
+## Testing
 
-This crate exposes the `bindings` module to access the C functions and statics directly.
+To test the GPS connection, use the following command:
 
-However, intended usage is through the `Gps` struct, which provides a safe wrapper for the unsafe C items.
+`timeout 3s sh -c 'dd if=/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3844945-if02 bs=1 count=64 status=none | xxd -g 1 -u'`
 
-This type exposes safe bindings with respect to the (kinda undocumented) safety constraints of the C code. Previous testing shows that violating these unspoken invariants can result in all kinds of weird behavior!
+If that works, great! Otherwise, you'll want to find the device path: `ls /dev/serial/by-id/ | grep Septentrio`. Then, replace the path in the command above with the one you got from that command. If there's multiple, test them all.
 
-## Usage (Rust)
-
-In short, you can use the various methods on `Gps` to interact with the Rover's GPS system.
-
-```rust
-use gps_rs::Gps;
-
-// we can make a GPS from a given IP address and port.
-//
-// on the Rover, this is from the router (hopefully a static IP) and a port
-let swift_ip: IpAddr = "192.168.1.222".parse().unwrap();
-let swift_port: u16 = 55556;
-
-// here, we make the GPS! this will automatically initialize it.
-let gps: Gps = Gps::new(swift_ip, swift_port).unwrap();
-
-// now, you can use its methods:
-println!("coord: {:?}", gps.coord());
-println!("height: {:?}", gps.height());
-println!("error in mm: {:?}", gps.error());
-
-// dropping it (when it falls from scope) automatically runs the required cleanup.
-```
-
-## Usage (Python)
-
-Unimplemented. This should use the `pyo3` feature to build, and I'll plan to upload it to PyPi soon.
-
-<!-- cargo-rdme end -->
+On the other hand, if none of those work, you should try configuring the streams on the GPS receiver. Ensure it's plugged into a computer with a display (like a laptop), then navigate to [its configuration page](http://192.168.3.1) and select the "NMEA/SBF Out" tab.
