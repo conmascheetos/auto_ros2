@@ -8,7 +8,8 @@ members = [
     "src/drive_tui",
     "src/custom_interfaces_shim",
     "src/maps_backend",
-    #
+    "src/object_detection",
+    
     # libraries (not ros 2 packages)
     "lib/feedback",
     "lib/soro_gps",
